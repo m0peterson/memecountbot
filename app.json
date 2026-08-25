@@ -1,0 +1,40 @@
+{
+  "name": "memecountbot",
+  "description": "Telegram bot that silently counts memes per person per day and replies to anyone who goes over the limit.",
+  "repository": "https://github.com/m0peterson/memecountbot",
+  "keywords": ["telegram", "bot", "openrouter", "llm", "memes"],
+  "stack": "container",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Telegram bot token from @BotFather",
+      "required": true
+    },
+    "OPENROUTER_API_KEY": {
+      "description": "API key from https://openrouter.ai/keys",
+      "required": true
+    },
+    "OPENROUTER_MODEL": {
+      "description": "Vision-capable model used for meme detection",
+      "value": "google/gemini-2.5-flash",
+      "required": false
+    },
+    "DAILY_LIMIT": {
+      "description": "Memes allowed per person per day",
+      "value": "5",
+      "required": false
+    },
+    "TIMEZONE": {
+      "description": "IANA timezone deciding when the daily counter resets",
+      "value": "Europe/Moscow",
+      "required": false
+    },
+    "WARNING_FILE": {
+      "description": "Image to reply with: local path, URL or Telegram file_id",
+      "value": "assets/warning.jpg",
+      "required": false
+    }
+  },
+  "formation": {
+    "worker": { "quantity": 1 }
+  }
+}

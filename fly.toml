@@ -1,0 +1,26 @@
+# fly.io deployment — `fly launch --copy-config --no-deploy` then:
+#   fly secrets set BOT_TOKEN=... OPENROUTER_API_KEY=...
+#   fly volumes create memecount_data --size 1
+#   fly deploy
+app = "memecountbot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/memecount.db"
+  TIMEZONE = "Europe/Moscow"
+  DAILY_LIMIT = "5"
+  OPENROUTER_MODEL = "google/gemini-2.5-flash"
+
+[mounts]
+  source = "memecount_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Long polling only — no inbound ports, so no [http_service] block and no
+# auto-stop: the machine must stay up to keep reading updates.

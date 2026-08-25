@@ -1,0 +1,30 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: https://render.com/deploy?repo=https://github.com/m0peterson/memecountbot
+services:
+  - type: worker
+    name: memecountbot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # you are prompted for this on deploy
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: google/gemini-2.5-flash
+      - key: DAILY_LIMIT
+        value: "5"
+      - key: TIMEZONE
+        value: Europe/Moscow
+      - key: WARNING_FILE
+        value: assets/warning.jpg
+      - key: DB_PATH
+        value: /var/data/memecount.db
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: memecount-data
+      mountPath: /var/data
+      sizeGB: 1
