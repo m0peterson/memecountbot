@@ -246,8 +246,96 @@ def test_llm_outage_counts_nothing_and_caches_nothing(tmp_path):
         assert sender.sent == []
         assert (await storage.get_state(-100, 42, "2026-08-25")).count == 0
         # crucially: the outage was not remembered as "not a meme"
-        assert await storage.get_verdict("sticker:su") is None
+        assert await storage.get_verdict(f"{rt.verdict_ns}:sticker:su") is None
         assert broken.calls == 3
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+class FailingSender:
+    """Telegram is down, or the warning asset is broken: nothing reaches the chat."""
+
+    def __init__(self, fail_times=99):
+        self.attempts = 0
+        self.sent = []
+        self._fail_times = fail_times
+
+    async def send(self, message):
+        self.attempts += 1
+        if self.attempts <= self._fail_times:
+            return False
+        self.sent.append(message)
+        return True
+
+
+def test_failed_delivery_does_not_burn_the_daily_warning(tmp_path):
+    sender = FailingSender(fail_times=1)
+    cfg, storage, rt = make_runtime(tmp_path, sender=sender)
+
+    async def scenario():
+        await storage.connect()
+        for i in range(1, 7):
+            await on_group_message(make_message(f"мем номер {i} про работу"), rt)
+        # The 6th meme crossed the limit but the reply never left the process,
+        # so the user must not be recorded as warned.
+        assert sender.attempts == 1
+        assert sender.sent == []
+        assert (await storage.get_state(-100, 42, "2026-08-25")).warned is False
+
+        # The next meme retries, succeeds, and only now is the warning spent.
+        await on_group_message(make_message("седьмой мем подряд"), rt)
+        assert sender.attempts == 2
+        assert len(sender.sent) == 1
+        assert (await storage.get_state(-100, 42, "2026-08-25")).warned is True
+
+        # And it really is once per day from here on.
+        await on_group_message(make_message("восьмой мем подряд"), rt)
+        assert sender.attempts == 2
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_persistent_delivery_failure_keeps_retrying(tmp_path):
+    sender = FailingSender()
+    cfg, storage, rt = make_runtime(tmp_path, sender=sender)
+
+    async def scenario():
+        await storage.connect()
+        for i in range(1, 10):
+            await on_group_message(make_message(f"мем номер {i} про работу"), rt)
+        assert sender.attempts == 4  # memes 6..9 each get a fresh attempt
+        assert (await storage.get_state(-100, 42, "2026-08-25")).count == 9
+        await storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_verdict_cache_is_scoped_to_the_model_and_threshold(tmp_path):
+    classifier, sender = FakeClassifier(), FakeSender()
+    cfg, storage, rt = make_runtime(tmp_path, classifier, sender)
+
+    sticker = NS(file_id="sf", file_unique_id="su", emoji="😂", set_name="Pack",
+                 is_animated=False, is_video=False, thumbnail=None)
+
+    async def scenario():
+        await storage.connect()
+        m = make_message(text=None)
+        m.sticker = sticker
+        m.bot = NS(download=_fake_download)
+        await on_group_message(m, rt)
+        assert classifier.calls == 1
+
+        # Raising the threshold must not reuse a verdict computed under the old one.
+        strict = Config(bot_token="t", openrouter_api_key="k", timezone=TZ,
+                        db_path=cfg.db_path, warning_file="", min_confidence=0.99)
+        rt2 = Runtime(strict, storage, classifier, sender)
+        m2 = make_message(text=None)
+        m2.sticker = sticker
+        m2.bot = NS(download=_fake_download)
+        await on_group_message(m2, rt2)
+        assert classifier.calls == 2
         await storage.close()
 
     asyncio.run(scenario())

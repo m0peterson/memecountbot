@@ -139,3 +139,23 @@ def test_json_mode_retry_does_not_consume_the_retry_budget():
     )
     assert verdict.is_meme is True
     assert len(stub.requests) == 4
+
+
+def test_unparseable_reply_is_retried_once():
+    verdict, stub = run_with_stub(
+        [(200, _content("Sure! It looks like a meme to me.")),
+         (200, _content('{"is_meme": true, "confidence": 0.9, "reason": "demotivator"}'))],
+        lambda c: c.classify(text="мемчик про понедельник"),
+    )
+    assert verdict.is_meme is True and verdict.reason == "demotivator"
+    assert len(stub.requests) == 2
+
+
+def test_a_reply_we_cannot_parse_twice_is_unknown():
+    """Garbage must not become a verdict: it would be cached and never revisited."""
+    verdict, stub = run_with_stub(
+        [(200, _content("{bad json meme}")), (200, _content("definitely a meme!"))],
+        lambda c: c.classify(text="мемчик про понедельник"),
+    )
+    assert verdict is None
+    assert len(stub.requests) == 2  # tried twice, then gave up rather than guessing

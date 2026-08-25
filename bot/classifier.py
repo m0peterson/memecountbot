@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -17,6 +18,13 @@ log = logging.getLogger(__name__)
 
 MAX_IMAGE_EDGE = 768
 JPEG_QUALITY = 82
+
+# Guards against decompression bombs: both are checked before any pixel is decoded.
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 50_000_000
+
+# Bump when SYSTEM_PROMPT changes in a way that should invalidate cached verdicts.
+PROMPT_VERSION = "1"
 
 SYSTEM_PROMPT = """You are a strict content classifier working inside a corporate Telegram group.
 Your only job is to decide whether a message is a MEME / entertainment content, or not.
@@ -53,36 +61,66 @@ class Verdict:
         return self.is_meme, self.confidence, self.reason
 
 
-NOT_A_MEME = Verdict(False, 0.0, "not a meme")
+def _flatten(img: Image.Image) -> Image.Image:
+    """Drop any alpha channel onto white, so transparency does not turn black in JPEG."""
+    if img.mode in {"RGBA", "LA"} or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        canvas = Image.new("RGB", rgba.size, (255, 255, 255))
+        canvas.paste(rgba, mask=rgba.getchannel("A"))
+        return canvas
+    return img.convert("RGB")
 
 
 def encode_image(raw: bytes) -> str | None:
     """Normalise arbitrary Telegram media bytes into a small base64 JPEG data URL."""
+    if not raw:
+        return None
+    if len(raw) > MAX_IMAGE_BYTES:
+        log.warning("refusing to decode %s bytes of media (limit %s)", len(raw), MAX_IMAGE_BYTES)
+        return None
     try:
         with Image.open(io.BytesIO(raw)) as img:
+            # ``Image.open`` only reads the header, so this runs before any decoding.
+            width, height = img.size
+            if width * height > MAX_IMAGE_PIXELS:
+                log.warning("refusing to decode a %sx%s image (limit %s pixels)",
+                            width, height, MAX_IMAGE_PIXELS)
+                return None
             img.seek(0)  # first frame of animated webp/gif
-            rgb = img.convert("RGB")
+            rgb = _flatten(img)
             rgb.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.LANCZOS)
             buf = io.BytesIO()
             rgb.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
         log.warning("could not decode media (%s bytes): %s", len(raw), exc)
         return None
     payload = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{payload}"
 
 
-def parse_verdict(content: str, min_confidence: float) -> Verdict:
-    """Pull the JSON verdict out of a model reply, tolerating fences and prose."""
+def verdict_namespace(model: str, min_confidence: float) -> str:
+    """Cache namespace that changes whenever the verdict would.
+
+    Verdicts are stored *after* the confidence threshold has been applied, so a
+    cached row is only valid for the prompt, model and threshold that produced it.
+    """
+    raw = f"{PROMPT_VERSION}|{model}|{min_confidence:.4f}|{SYSTEM_PROMPT}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_verdict(content: str, min_confidence: float) -> Verdict | None:
+    """Pull the JSON verdict out of a model reply, tolerating fences and prose.
+
+    Returns ``None`` when the reply cannot be understood. That is *unknown*, not
+    *not a meme*: guessing from stray words like "meme" would sidestep
+    ``min_confidence`` entirely, and storing the guess would poison the cache.
+    """
     if not content:
-        return NOT_A_MEME
+        return None
     data = _loads(content)
     if data is None:
-        # Last resort: a bare yes/no somewhere in the text.
-        lowered = content.lower()
-        if re.search(r"\b(true|yes|meme)\b", lowered) and "not a meme" not in lowered:
-            return Verdict(True, 0.5, "unstructured reply")
-        return NOT_A_MEME
+        log.warning("could not parse a verdict out of the model reply: %r", content[:200])
+        return None
 
     raw_flag = data.get("is_meme")
     if isinstance(raw_flag, str):
@@ -191,12 +229,19 @@ class MemeClassifier:
             "response_format": {"type": "json_object"},
         }
 
-        content = await self._post(payload)
-        if content is None:
-            return None
-        verdict = parse_verdict(content, self._min_confidence)
-        log.debug("verdict=%s reason=%s", verdict.is_meme, verdict.reason)
-        return verdict
+        # A reply we cannot parse is worth one more shot before giving up: the
+        # model is reachable, it just answered badly.
+        for attempt in (1, 2):
+            content = await self._post(payload)
+            if content is None:
+                return None
+            verdict = parse_verdict(content, self._min_confidence)
+            if verdict is not None:
+                log.debug("verdict=%s reason=%s", verdict.is_meme, verdict.reason)
+                return verdict
+            if attempt == 1:
+                log.info("retrying after an unparseable reply from %s", self._model)
+        return None
 
     async def _post(self, payload: dict) -> str | None:
         delay = 1.0

@@ -19,6 +19,10 @@ DEFAULT_WARNING_TEXT = (
 )
 
 
+class ConfigError(RuntimeError):
+    """Raised when required configuration is missing or invalid."""
+
+
 def _str(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
@@ -51,6 +55,12 @@ def _float(name: str, default: float) -> float:
 
 
 def _id_set(name: str) -> set[int] | None:
+    """Parse a comma-separated id list, or ``None`` when the variable is unset.
+
+    A malformed entry is fatal on purpose: for an allowlist, silently dropping
+    the id it could not read would leave an empty set, and an empty set means
+    "no restriction" — a typo would quietly switch the allowlist off.
+    """
     raw = _str(name)
     if not raw:
         return None
@@ -62,12 +72,13 @@ def _id_set(name: str) -> set[int] | None:
         try:
             ids.add(int(part))
         except ValueError:
-            continue
-    return ids or None
-
-
-class ConfigError(RuntimeError):
-    """Raised when required configuration is missing or invalid."""
+            raise ConfigError(
+                f"{name} contains {part!r}, which is not a numeric Telegram id. "
+                f"Use a comma-separated list of ids, for example {name}=-1001234567890"
+            ) from None
+    if not ids:
+        raise ConfigError(f"{name} is set but lists no ids. Leave it empty to disable it.")
+    return ids
 
 
 @dataclass(frozen=True)
@@ -106,6 +117,7 @@ class Config:
     allowed_chats: set[int] | None = None
     admin_ids: set[int] | None = None
     enable_commands: bool = True
+    drop_pending_updates: bool = False
     health_port: int = 0
     log_level: str = "INFO"
     cache_verdicts: bool = True
@@ -167,6 +179,7 @@ def load_config() -> Config:
         allowed_chats=_id_set("ALLOWED_CHATS"),
         admin_ids=_id_set("ADMIN_IDS"),
         enable_commands=_bool("ENABLE_COMMANDS", True),
+        drop_pending_updates=_bool("DROP_PENDING_UPDATES", False),
         health_port=_int("PORT", 0),
         log_level=_str("LOG_LEVEL", "INFO").upper(),
         cache_verdicts=_bool("CACHE_VERDICTS", True),

@@ -18,7 +18,7 @@ from aiogram.exceptions import (
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from bot.classifier import MemeClassifier, Verdict
+from bot.classifier import MemeClassifier, Verdict, verdict_namespace
 from bot.config import Config, ConfigError, load_config
 from bot.media import Candidate, build_candidate
 from bot.storage import Storage
@@ -41,6 +41,8 @@ class Runtime:
         self.storage = storage
         self.classifier = classifier
         self.sender = sender
+        # Cached verdicts are only valid for the model/prompt/threshold that produced them.
+        self.verdict_ns = verdict_namespace(cfg.openrouter_model, cfg.min_confidence)
 
 
 # --------------------------------------------------------------------- helpers
@@ -87,7 +89,9 @@ async def judge(rt: Runtime, bot: Bot, candidate: Candidate) -> Verdict | None:
     if candidate.kind == "sticker" and cfg.count_stickers_as_memes:
         return Verdict(True, 1.0, "stickers always count")
 
-    key = candidate.cache_key if cfg.cache_verdicts else None
+    key = f"{rt.verdict_ns}:{candidate.cache_key}" if (
+        cfg.cache_verdicts and candidate.cache_key
+    ) else None
     if key:
         cached = await rt.storage.get_verdict(key)
         if cached is not None:
@@ -190,7 +194,11 @@ async def on_group_message(message: Message, rt: Runtime) -> None:
     if verdict is None or not verdict.is_meme:
         return
 
-    count = await rt.storage.increment(message.chat.id, user.id, day)
+    # Counting and claiming the warning happen together, so that when several
+    # memes land at once the warning lands on the one that crossed the limit.
+    count, claimed = await rt.storage.increment_and_claim(
+        message.chat.id, user.id, day, cfg.warn_threshold
+    )
     log.info(
         "meme #%s by %s (%s) in %s [%s] — %s",
         count, display_name(user), user.id, message.chat.id, candidate.kind, verdict.reason,
@@ -198,14 +206,18 @@ async def on_group_message(message: Message, rt: Runtime) -> None:
 
     if count < cfg.warn_threshold:
         return
-
-    first_warning = await rt.storage.mark_warned(message.chat.id, user.id, day)
-    if cfg.warn_once_per_day and not first_warning:
+    if cfg.warn_once_per_day and not claimed:
         return
 
     if await rt.sender.send(message):
         log.info("warned %s (%s) in chat %s after %s memes",
                  display_name(user), user.id, message.chat.id, count)
+    elif claimed:
+        # Nothing reached the chat, so the user is not actually warned yet.
+        # Hand the claim back or they would be skipped for the rest of the day.
+        await rt.storage.clear_warned(message.chat.id, user.id, day)
+        log.warning("warning delivery failed for %s (%s) in chat %s — will retry on the next meme",
+                    display_name(user), user.id, message.chat.id)
 
 
 @router.errors()
@@ -221,7 +233,7 @@ async def _purge_loop(storage: Storage, retention_days: int) -> None:
         try:
             removed = await storage.purge_old(retention_days)
             if removed:
-                log.info("purged %s counter rows older than %s days", removed, retention_days)
+                log.info("purged %s rows older than %s days", removed, retention_days)
         except Exception:  # noqa: BLE001 - a housekeeping loop must never die
             log.exception("purge failed")
         await asyncio.sleep(PURGE_INTERVAL_SECONDS)
@@ -302,7 +314,7 @@ async def run(cfg: Config) -> None:
         await _health_server(cfg.health_port)
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=cfg.drop_pending_updates)
         await dp.start_polling(bot, allowed_updates=["message"])
     finally:
         for task in tasks:

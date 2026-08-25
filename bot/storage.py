@@ -107,40 +107,78 @@ class Storage:
             return DailyState(count=0, warned=False)
         return DailyState(count=row["count"], warned=row["warned_at"] is not None)
 
+    async def increment_and_claim(
+        self, chat_id: int, user_id: int, day: str, threshold: int
+    ) -> tuple[int, bool]:
+        """Count one meme and, in the same critical section, claim the warning.
+
+        Returns ``(new_count, claimed)``. ``claimed`` is True only for the call
+        that pushed the user to ``threshold`` first and found ``warned_at`` unset.
+        Doing both under one lock is what keeps the warning attached to the
+        message that actually crossed the limit when several arrive at once.
+        """
+        async with self._lock:
+            count = await self._bump(chat_id, user_id, day)
+            claimed = False
+            if count >= threshold:
+                claimed = await self._claim_warning(chat_id, user_id, day)
+            await self.db.commit()
+        return count, claimed
+
     async def increment(self, chat_id: int, user_id: int, day: str) -> int:
         """Increment the daily meme counter and return the new value."""
         async with self._lock:
-            now = datetime.now(self._tz).isoformat(timespec="seconds")
-            await self.db.execute(
-                """
-                INSERT INTO meme_counts (chat_id, user_id, day, count, updated_at)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(chat_id, user_id, day)
-                DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
-                """,
-                (chat_id, user_id, day, now),
-            )
+            count = await self._bump(chat_id, user_id, day)
             await self.db.commit()
-            async with self.db.execute(
-                "SELECT count FROM meme_counts WHERE chat_id=? AND user_id=? AND day=?",
-                (chat_id, user_id, day),
-            ) as cur:
-                row = await cur.fetchone()
-        return int(row["count"]) if row else 1
+        return count
 
     async def mark_warned(self, chat_id: int, user_id: int, day: str) -> bool:
         """Flag the user as warned today. Returns False if already flagged."""
         async with self._lock:
-            now = datetime.now(self._tz).isoformat(timespec="seconds")
-            cur = await self.db.execute(
-                """
-                UPDATE meme_counts SET warned_at = ?
-                WHERE chat_id=? AND user_id=? AND day=? AND warned_at IS NULL
-                """,
-                (now, chat_id, user_id, day),
+            claimed = await self._claim_warning(chat_id, user_id, day)
+            await self.db.commit()
+            return claimed
+
+    async def clear_warned(self, chat_id: int, user_id: int, day: str) -> None:
+        """Give a claimed warning back, so a failed delivery can be retried."""
+        async with self._lock:
+            await self.db.execute(
+                "UPDATE meme_counts SET warned_at = NULL "
+                "WHERE chat_id=? AND user_id=? AND day=?",
+                (chat_id, user_id, day),
             )
             await self.db.commit()
-            return cur.rowcount > 0
+
+    async def _bump(self, chat_id: int, user_id: int, day: str) -> int:
+        """Increment the counter and read it back. Caller holds the lock."""
+        now = datetime.now(self._tz).isoformat(timespec="seconds")
+        await self.db.execute(
+            """
+            INSERT INTO meme_counts (chat_id, user_id, day, count, updated_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(chat_id, user_id, day)
+            DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
+            """,
+            (chat_id, user_id, day, now),
+        )
+        async with self.db.execute(
+            "SELECT count FROM meme_counts WHERE chat_id=? AND user_id=? AND day=?",
+            (chat_id, user_id, day),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["count"]) if row else 1
+
+    async def _claim_warning(self, chat_id: int, user_id: int, day: str) -> bool:
+        """Set ``warned_at`` if it is unset. Caller holds the lock and commits."""
+        now = datetime.now(self._tz).isoformat(timespec="seconds")
+        cur = await self.db.execute(
+            """
+            UPDATE meme_counts SET warned_at = ?
+            WHERE chat_id=? AND user_id=? AND day=? AND warned_at IS NULL
+            """,
+            (now, chat_id, user_id, day),
+        )
+        return cur.rowcount > 0
 
     async def leaderboard(self, chat_id: int, day: str, limit: int = 10) -> list[tuple[int, int]]:
         async with self.db.execute(
@@ -163,14 +201,23 @@ class Storage:
             return cur.rowcount
 
     async def purge_old(self, retention_days: int) -> int:
-        """Drop counters older than the retention window (daily reset is implicit)."""
+        """Drop counters and cached verdicts older than the retention window.
+
+        ``created_at`` is an ISO timestamp, so comparing it to a ``YYYY-MM-DD``
+        cutoff string is a correct date comparison.
+        """
         if retention_days <= 0:
             return 0
         cutoff = (datetime.now(self._tz).date() - timedelta(days=retention_days)).isoformat()
         async with self._lock:
-            cur = await self.db.execute("DELETE FROM meme_counts WHERE day < ?", (cutoff,))
+            counts = await self.db.execute("DELETE FROM meme_counts WHERE day < ?", (cutoff,))
+            removed = counts.rowcount
+            cache = await self.db.execute(
+                "DELETE FROM verdict_cache WHERE created_at < ?", (cutoff,)
+            )
+            removed += cache.rowcount
             await self.db.commit()
-            return cur.rowcount
+            return removed
 
     # ------------------------------------------------------------------- cache
 

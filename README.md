@@ -70,7 +70,7 @@ prompt you for `BOT_TOKEN` and `OPENROUTER_API_KEY`.
 |---|---|---|
 | **Any VPS / your laptop** | `./setup.sh` | Simplest. Docker Compose with `restart: unless-stopped`. |
 | **Render** | button above | Deploys as a *background worker* with a 1 GB disk. Render has no free worker tier. |
-| **Railway** | button above | Uses `railway.json`. |
+| **Railway** | button above | Uses `railway.json`. Attach a [volume](https://docs.railway.com/volumes) mounted at `/app/data` — Railway containers have no persistent disk by default, so without one the SQLite file and verdict cache are wiped on every redeploy. |
 | **Fly.io** | `fly launch --copy-config --no-deploy && fly volumes create memecount_data --size 1 && fly secrets set BOT_TOKEN=… OPENROUTER_API_KEY=… && fly deploy` | See `fly.toml`. Don't enable auto-stop — long polling needs the machine awake. |
 
 The bot uses long polling, so it needs no public URL, no webhook and no open
@@ -78,7 +78,9 @@ port. If your platform insists on a listening port, set `PORT` and it will
 serve a `/health` endpoint on it.
 
 State lives in a single SQLite file (`DB_PATH`). Losing it costs you today's
-counters and nothing else.
+counters and the verdict cache, and nothing else — but on platforms whose
+containers have no persistent disk (Railway, and Fly without a volume) that
+happens on every redeploy, so mount a volume at the directory `DB_PATH` lives in.
 
 ---
 
@@ -103,9 +105,10 @@ inline. The ones worth knowing:
 | `WARNING_FILE` | `assets/warning.jpg` | Local path, URL or Telegram `file_id`. |
 | `WARNING_TYPE` | `auto` | Force `photo` / `sticker` / `animation` / `video` / `document` / `text`. |
 | `WARNING_TEXT` | the Стахановец quote | Fallback text, and the caption when `SEND_WARNING_CAPTION=true`. |
-| `ALLOWED_CHATS` | *(all)* | Comma-separated chat ids the bot may work in. |
+| `ALLOWED_CHATS` | *(all)* | Comma-separated chat ids the bot may work in. A malformed id is a startup error, not a warning — an unreadable allowlist would otherwise mean "allow everything". |
 | `ADMIN_IDS` | *(chat admins)* | Extra users allowed to run `/memereset`. |
 | `ENABLE_COMMANDS` | `true` | Set to `false` for a completely silent bot. |
+| `DROP_PENDING_UPDATES` | `false` | On restart, discard messages Telegram buffered during the downtime. |
 | `DB_PATH` | `data/memecount.db` | SQLite file location. |
 
 ### Commands
@@ -113,7 +116,10 @@ inline. The ones worth knowing:
 Optional, and only inside group chats:
 
 - `/memestats` — today's leaderboard
-- `/memereset` — clear today's counters (chat admins only)
+- `/memereset` — clear today's counters (chat admins only). Admin status is checked with
+  [`getChatMember`](https://core.telegram.org/bots/api#getchatmember), which the bot can only
+  answer reliably for other members once it is an administrator itself. If it is not, list the
+  people who should be able to reset in `ADMIN_IDS` instead.
 - `/memehelp` — what the bot does and the current limit
 
 ---
