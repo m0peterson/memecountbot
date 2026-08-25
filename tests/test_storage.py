@@ -123,3 +123,73 @@ def test_day_key_uses_configured_timezone(tmp_path):
     moment = datetime(2026, 8, 25, 22, 30, tzinfo=timezone.utc)
     assert s.today(moment) == "2026-08-26"
     run(s.close())
+
+
+def test_increment_and_claim_is_atomic(tmp_path):
+    s = fresh(tmp_path)
+
+    async def scenario():
+        # Below the threshold nobody claims the warning.
+        for _ in range(5):
+            count, claimed = await s.increment_and_claim(-1, 7, "2026-08-25", 6)
+            assert claimed is False
+        assert count == 5
+
+        count, claimed = await s.increment_and_claim(-1, 7, "2026-08-25", 6)
+        assert (count, claimed) == (6, True)
+        # The claim is exclusive: later memes count but do not claim again.
+        count, claimed = await s.increment_and_claim(-1, 7, "2026-08-25", 6)
+        assert (count, claimed) == (7, False)
+        await s.close()
+
+    run(scenario())
+
+
+def test_exactly_one_concurrent_meme_claims_the_warning(tmp_path):
+    s = fresh(tmp_path)
+
+    async def scenario():
+        results = await asyncio.gather(
+            *(s.increment_and_claim(-1, 7, "2026-08-25", 6) for _ in range(20))
+        )
+        counts = sorted(c for c, _ in results)
+        assert counts == list(range(1, 21))          # no increment was lost
+        claimants = [c for c, claimed in results if claimed]
+        assert claimants == [6]                       # the 6th meme, and only it
+        await s.close()
+
+    run(scenario())
+
+
+def test_clear_warned_allows_a_retry(tmp_path):
+    s = fresh(tmp_path)
+
+    async def scenario():
+        await s.increment(-1, 7, "2026-08-25")
+        assert await s.mark_warned(-1, 7, "2026-08-25") is True
+        await s.clear_warned(-1, 7, "2026-08-25")
+        assert (await s.get_state(-1, 7, "2026-08-25")).warned is False
+        assert await s.mark_warned(-1, 7, "2026-08-25") is True
+        await s.close()
+
+    run(scenario())
+
+
+def test_purge_old_also_evicts_stale_cached_verdicts(tmp_path):
+    s = fresh(tmp_path)
+
+    async def scenario():
+        await s.put_verdict("ns:fresh", True, 0.9, "joke")
+        await s.db.execute(
+            "UPDATE verdict_cache SET created_at = ? WHERE cache_key = ?",
+            ("2020-01-01T00:00:00+03:00", "ns:fresh"),
+        )
+        await s.put_verdict("ns:recent", False, 0.9, "dashboard")
+        await s.db.commit()
+
+        assert await s.purge_old(30) == 1
+        assert await s.get_verdict("ns:fresh") is None
+        assert await s.get_verdict("ns:recent") is not None
+        await s.close()
+
+    run(scenario())
